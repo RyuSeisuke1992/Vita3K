@@ -33,12 +33,16 @@
 #include <gxm/functions.h>
 #include <gxm/types.h>
 #include <util/log.h>
+#include <util/float_to_half.h>
 
 #include <SDL3/SDL_video.h>
 
+#include <cmath>
+#include <algorithm>
 #include <array>
 #include <mutex>
 #include <string_view>
+#include <cstring>
 
 namespace renderer::gl {
 
@@ -423,7 +427,10 @@ static std::map<SceGxmColorFormat, std::pair<GLenum, GLenum>> GXM_COLOR_FORMAT_T
     { SCE_GXM_COLOR_FORMAT_U8U8_AR, { GL_RG, GL_UNSIGNED_BYTE } },
     { SCE_GXM_COLOR_FORMAT_U8_A, { GL_ALPHA, GL_UNSIGNED_BYTE } },
     { SCE_GXM_COLOR_FORMAT_U8_R, { GL_RED, GL_UNSIGNED_BYTE } },
-    { SCE_GXM_COLOR_FORMAT_U2F10F10F10_ABGR, { GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV } },
+    { SCE_GXM_COLOR_FORMAT_U2F10F10F10_ABGR, { GL_BGRA, GL_HALF_FLOAT } },
+    { SCE_GXM_COLOR_FORMAT_U2F10F10F10_ARGB, { GL_RGBA, GL_HALF_FLOAT } },
+    { SCE_GXM_COLOR_FORMAT_F10F10F10U2_RGBA, { GL_RGBA, GL_HALF_FLOAT } },
+    { SCE_GXM_COLOR_FORMAT_F10F10F10U2_BGRA, { GL_BGRA, GL_HALF_FLOAT } },
     { SCE_GXM_COLOR_FORMAT_U2U10U10U10_ABGR, { GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV } },
     { SCE_GXM_COLOR_FORMAT_U10U10U10U2_RGBA, { GL_BGRA, GL_UNSIGNED_INT_10_10_10_2 } },
     { SCE_GXM_COLOR_FORMAT_U10U10U10U2_BGRA, { GL_RGBA, GL_UNSIGNED_INT_10_10_10_2 } },
@@ -452,6 +459,11 @@ static bool format_need_temp_storage(const GLState &state, SceGxmColorSurface &s
         return true;
     }
 
+    if (gxm::get_base_format(surface.colorFormat) == SCE_GXM_COLOR_BASE_FORMAT_U2F10F10F10) {
+        storage.resize(needed_pixels * 4 * sizeof(uint16_t));
+        return true;
+    }
+
     if (state.res_multiplier > 1.0f) {
         storage.resize(needed_pixels * gxm::bits_per_pixel(gxm::get_base_format(surface.colorFormat)) >> 3);
         return true;
@@ -462,22 +474,90 @@ static bool format_need_temp_storage(const GLState &state, SceGxmColorSurface &s
 
 static void post_process_pixels_data(GLState &renderer, std::uint32_t *pixels, std::uint8_t *source, std::uint32_t width, std::uint32_t height, const std::uint32_t stride,
     SceGxmColorSurface &surface) {
+    auto f16_to_f10 = [](uint16_t value) {
+        if (value & 0x8000) {
+            return static_cast<uint16_t>(0);
+        }
+
+        uint16_t exponent = (value >> 10) & 0x1F;
+        if (exponent == 0) {
+            return static_cast<uint16_t>(0);
+        }
+
+        uint16_t mantissa = value & 0x3FF;
+        uint16_t rounded = static_cast<uint16_t>((mantissa + 0x10) >> 5);
+        if (rounded == 0x20) {
+            rounded = 0;
+            exponent = static_cast<uint16_t>(std::min<uint16_t>(0x1F, static_cast<uint16_t>(exponent + 1)));
+            if (exponent == 0x1F) {
+                rounded = 0x1F;
+            }
+        }
+
+        return static_cast<uint16_t>((exponent << 5) | (rounded & 0x1F));
+    };
+
+    auto f16_to_u2 = [](uint16_t value) {
+        float decoded = util::decode_flt16<float>(value);
+        if (!std::isfinite(decoded) || decoded <= 0.0f) {
+            return static_cast<uint16_t>(0);
+        }
+
+        if (decoded >= 0.833333313f) {
+            return static_cast<uint16_t>(3);
+        }
+        if (decoded >= 0.5f) {
+            return static_cast<uint16_t>(2);
+        }
+        if (decoded >= 0.166666657f) {
+            return static_cast<uint16_t>(1);
+        }
+        return static_cast<uint16_t>(0);
+    };
+
+    auto pack_half_to_u2f10 = [&](const uint16_t *components, SceGxmColorFormat format) {
+        const bool alpha_upper = (format == SCE_GXM_COLOR_FORMAT_U2F10F10F10_ABGR) || (format == SCE_GXM_COLOR_FORMAT_U2F10F10F10_ARGB);
+
+        const uint16_t comp0 = f16_to_f10(components[0]);
+        const uint16_t comp1 = f16_to_f10(components[1]);
+        const uint16_t comp2 = f16_to_f10(components[2]);
+        const uint16_t u2 = f16_to_u2(components[3]);
+
+        if (alpha_upper) {
+            return static_cast<uint32_t>(comp0)
+                | (static_cast<uint32_t>(comp1) << 10)
+                | (static_cast<uint32_t>(comp2) << 20)
+                | (static_cast<uint32_t>(u2) << 30);
+        }
+
+        return static_cast<uint32_t>(u2)
+            | (static_cast<uint32_t>(comp0) << 2)
+            | (static_cast<uint32_t>(comp1) << 12)
+            | (static_cast<uint32_t>(comp2) << 22);
+    };
+
     uint8_t *curr_input = source;
     uint8_t *curr_output = reinterpret_cast<uint8_t *>(pixels);
 
     const bool is_U8U8U8_RGBA = surface.colorFormat == SCE_GXM_COLOR_FORMAT_U8U8U8U8_RGBA;
     const bool is_SE5M9M9M9 = (surface.colorFormat == SCE_GXM_COLOR_FORMAT_SE5M9M9M9_RGB) || (surface.colorFormat == SCE_GXM_COLOR_FORMAT_SE5M9M9M9_BGR);
+    const bool is_U2F10 = gxm::get_base_format(surface.colorFormat) == SCE_GXM_COLOR_BASE_FORMAT_U2F10F10F10;
 
     const int multiplier = static_cast<int>(renderer.res_multiplier);
-    if (multiplier > 1 || is_U8U8U8_RGBA || is_SE5M9M9M9) {
+    if (multiplier > 1 || is_U8U8U8_RGBA || is_SE5M9M9M9 || is_U2F10) {
         // TODO: do this on the GPU instead (using texture blitting?)
         const int bytes_per_output_pixel = (gxm::bits_per_pixel(gxm::get_base_format(surface.colorFormat)) + 7) >> 3;
-        const int bytes_per_input_pixel = is_SE5M9M9M9 ? 6 : bytes_per_output_pixel;
+        const int bytes_per_input_pixel = is_SE5M9M9M9 ? 6 : (is_U2F10 ? 8 : bytes_per_output_pixel);
 
         const uint32_t end_stride_bytes = bytes_per_output_pixel * (surface.strideInPixels - surface.width);
         for (uint32_t row = 0; row < surface.height; row++) {
             for (uint32_t col = 0; col < surface.width; col++) {
-                if (!is_SE5M9M9M9) {
+                if (is_U2F10) {
+                    uint16_t components[4];
+                    std::memcpy(components, curr_input, sizeof(components));
+                    const uint32_t packed = pack_half_to_u2f10(components, surface.colorFormat);
+                    std::memcpy(curr_output, &packed, sizeof(packed));
+                } else if (!is_SE5M9M9M9) {
                     memcpy(curr_output, curr_input, bytes_per_input_pixel);
 
                     if (is_U8U8U8_RGBA) {
