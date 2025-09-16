@@ -37,9 +37,12 @@
 #endif
 
 #include <cassert>
+#include <chrono>
+#include <fstream>
 #include <iostream>
 #include <iterator>
 #include <string>
+#include <thread>
 
 #if defined(__aarch64__) && defined(__APPLE__)
 #define stat64 stat
@@ -90,6 +93,47 @@ SceSize get_directory_used_size(const VitaIoDevice device, const std::string &vf
 // ****************************
 // * End utility functions *
 // ****************************
+
+namespace {
+
+const auto file_ready_timeout = std::chrono::milliseconds(1500);
+const auto file_ready_poll_interval = std::chrono::milliseconds(5);
+
+bool wait_for_host_path_ready(const fs::path &path, std::chrono::milliseconds timeout = file_ready_timeout) {
+    using clock = std::chrono::steady_clock;
+
+    const auto deadline = clock::now() + timeout;
+
+    boost::system::error_code error;
+
+    const auto is_ready = [&]() -> bool {
+        const auto status = fs::status(path, error);
+        if (error) {
+            error.clear();
+            return false;
+        }
+
+        if (!fs::exists(status))
+            return false;
+
+        if (fs::is_directory(status))
+            return true;
+
+        fs::ifstream stream(path, std::ios::binary);
+        return stream.is_open();
+    };
+
+    while (clock::now() < deadline) {
+        if (is_ready())
+            return true;
+
+        std::this_thread::sleep_for(file_ready_poll_interval);
+    }
+
+    return is_ready();
+}
+
+} // namespace
 
 bool init(IOState &io, const fs::path &cache_path, const fs::path &log_path, const fs::path &pref_path, bool redirect_stdio) {
     // Iterate through the entire list of devices and create the subdirectories if they do not exist
@@ -316,35 +360,53 @@ SceUID open_file(IOState &io, const char *path, const int flags, const fs::path 
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
 
-    // Do not allow any new files if they do not have a write flag.
-    if (!fs::exists(system_path)) {
-        if (!(flags & SCE_O_CREAT)) {
-            if (io.case_isens_find_enabled) {
-                // Attempt a case-insensitive file search.
-                const auto original_system_path = system_path;
-                const auto cached_path = find_in_cache(io, string_utils::tolower(system_path.string()));
-                if (!cached_path.empty()) {
-                    system_path = cached_path;
-                    LOG_TRACE("Found cached filepath at {}", system_path);
-                } else {
-                    const bool path_found = find_case_isens_path(io, device_for_icase, translated_path, system_path);
-                    system_path = find_in_cache(io, string_utils::tolower(system_path.string()));
-                    if (!system_path.empty() && path_found) {
-                        LOG_TRACE("Found file on case-sensitive filesystem at {}", system_path);
-                    } else {
-                        LOG_ERROR("Missing file at {} (target path: {})", original_system_path, path);
-                        return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
-                    }
-                }
-            } else {
-                LOG_ERROR("Missing file at {} (target path: {})", system_path, path);
-                return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
-            }
-        } else {
+    if (flags & SCE_O_CREAT) {
+        if (!fs::exists(system_path)) {
             if (!fs::exists(system_path.parent_path())) {
                 fs::create_directories(system_path.parent_path());
             }
             fs::ofstream file(system_path);
+        }
+
+        if (!wait_for_host_path_ready(system_path)) {
+            LOG_ERROR("Timed out waiting for created file {} (target path: {})", system_path, path);
+            return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+        }
+    } else if (!wait_for_host_path_ready(system_path)) {
+        if (fs::exists(system_path)) {
+            LOG_ERROR("Timed out waiting for file {} to become ready (target path: {})", system_path, path);
+            return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+        }
+
+        if (io.case_isens_find_enabled) {
+            // Attempt a case-insensitive file search.
+            const auto original_system_path = system_path;
+            const auto cached_path = find_in_cache(io, string_utils::tolower(system_path.string()));
+            if (!cached_path.empty()) {
+                system_path = cached_path;
+                LOG_TRACE("Found cached filepath at {}", system_path);
+            } else {
+                const bool path_found = find_case_isens_path(io, device_for_icase, translated_path, system_path);
+                system_path = find_in_cache(io, string_utils::tolower(system_path.string()));
+                if (!system_path.empty() && path_found) {
+                    LOG_TRACE("Found file on case-sensitive filesystem at {}", system_path);
+                } else {
+                    LOG_ERROR("Missing file at {} (target path: {})", original_system_path, path);
+                    return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+                }
+            }
+
+            if (!wait_for_host_path_ready(system_path)) {
+                if (fs::exists(system_path)) {
+                    LOG_ERROR("Timed out waiting for file {} to become ready (target path: {})", system_path, path);
+                } else {
+                    LOG_ERROR("Missing file at {} (target path: {})", system_path, path);
+                }
+                return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+            }
+        } else {
+            LOG_ERROR("Missing file at {} (target path: {})", system_path, path);
+            return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
         }
     }
 
@@ -496,7 +558,12 @@ int stat_file(IOState &io, const char *file, SceIoStat *statp, const fs::path &p
         const auto translated_path = translate_path(file, device, io.device_paths);
         file_path = device::construct_emulated_path(device, translated_path, pref_path, io.redirect_stdio);
 
-        if (!fs::exists(file_path)) {
+        if (!wait_for_host_path_ready(file_path)) {
+            if (fs::exists(file_path)) {
+                LOG_ERROR("Timed out waiting for file {} to become ready (target path: {})", file_path, file);
+                return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+            }
+
             if (io.case_isens_find_enabled) {
                 // Attempt a case-insensitive file search.
                 const auto original_file_path = file_path;
@@ -514,6 +581,15 @@ int stat_file(IOState &io, const char *file, SceIoStat *statp, const fs::path &p
                         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
                     }
                 }
+
+                if (!wait_for_host_path_ready(file_path)) {
+                    if (fs::exists(file_path)) {
+                        LOG_ERROR("Timed out waiting for file {} to become ready (target path: {})", file_path, file);
+                    } else {
+                        LOG_ERROR("Missing file at {} (target path: {})", file_path, file);
+                    }
+                    return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+                }
             } else {
                 LOG_ERROR("Missing file at {} (target path: {})", file_path, file);
                 return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
@@ -529,6 +605,15 @@ int stat_file(IOState &io, const char *file, SceIoStat *statp, const fs::path &p
         LOG_TRACE_IF(log_file_op && log_file_stat, "{}: Statting fd: {}", export_name, log_hex(fd));
 
         statp->st_attr = fd_file->second.get_file_mode();
+    }
+
+    if (!wait_for_host_path_ready(file_path)) {
+        if (fs::exists(file_path)) {
+            LOG_ERROR("Timed out waiting for file {} to become ready (target path: {})", file_path, file);
+        } else {
+            LOG_ERROR("Missing file at {} (target path: {})", file_path, file);
+        }
+        return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
 
     std::uint64_t last_access_time_ticks;
@@ -650,8 +735,12 @@ int rename(IOState &io, const char *old_name, const char *new_name, const fs::pa
     }
 
     const auto emulated_old_path = device::construct_emulated_path(device, translated_old_path, pref_path, io.redirect_stdio);
-    if (!fs::exists(emulated_old_path)) {
-        LOG_ERROR("File does not exist at path: {} (target path: {})", emulated_old_path, old_name);
+    if (!wait_for_host_path_ready(emulated_old_path)) {
+        if (!fs::exists(emulated_old_path)) {
+            LOG_ERROR("File does not exist at path: {} (target path: {})", emulated_old_path, old_name);
+        } else {
+            LOG_ERROR("Timed out waiting for file {} to become ready for rename (target path: {})", emulated_old_path, old_name);
+        }
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
 
@@ -665,6 +754,15 @@ int rename(IOState &io, const char *old_name, const char *new_name, const fs::pa
     if (error_code.value()) {
         LOG_ERROR("Cannot rename file: {} to {} ({} to {})", old_name, new_name, emulated_old_path, emulated_new_path);
         LOG_ERROR("Error code: {} ({})", error_code.value(), error_code.message());
+        return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+    }
+
+    if (!wait_for_host_path_ready(emulated_new_path)) {
+        if (fs::exists(emulated_new_path)) {
+            LOG_ERROR("Timed out waiting for renamed file {} to become ready (target path: {})", emulated_new_path, new_name);
+        } else {
+            LOG_ERROR("Missing file at {} after rename (target path: {})", emulated_new_path, new_name);
+        }
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
 
