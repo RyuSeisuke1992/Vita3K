@@ -99,38 +99,74 @@ namespace {
 const auto file_ready_timeout = std::chrono::milliseconds(1500);
 const auto file_ready_poll_interval = std::chrono::milliseconds(5);
 
-bool wait_for_host_path_ready(const fs::path &path, std::chrono::milliseconds timeout = file_ready_timeout) {
+enum class HostPathWaitMode {
+    WaitForAppearance,
+    FailIfMissing
+};
+
+HostPathWaitMode wait_mode_for_vita_path(const char *vita_path) {
+    if (!vita_path)
+        return HostPathWaitMode::WaitForAppearance;
+
+    const auto lowered = string_utils::tolower(std::string(vita_path));
+
+    if (lowered.rfind("savedata0:", 0) == 0 || lowered.rfind("savedata1:", 0) == 0)
+        return HostPathWaitMode::FailIfMissing;
+
+    const auto user_pos = lowered.find("/user/");
+    if (user_pos != std::string::npos) {
+        const auto savedata_pos = lowered.find("/savedata/", user_pos + 6);
+        if (savedata_pos != std::string::npos)
+            return HostPathWaitMode::FailIfMissing;
+    }
+
+    return HostPathWaitMode::WaitForAppearance;
+}
+
+bool wait_for_host_path_ready(const fs::path &path, HostPathWaitMode wait_mode = HostPathWaitMode::WaitForAppearance,
+    std::chrono::milliseconds timeout = file_ready_timeout) {
     using clock = std::chrono::steady_clock;
 
     const auto deadline = clock::now() + timeout;
-
-    boost::system::error_code error;
-
-    const auto is_ready = [&]() -> bool {
-        const auto status = fs::status(path, error);
-        if (error) {
-            error.clear();
-            return false;
-        }
-
-        if (!fs::exists(status))
-            return false;
-
-        if (fs::is_directory(status))
-            return true;
-
-        fs::ifstream stream(path, std::ios::binary);
-        return stream.is_open();
-    };
+    bool observed_existence = false;
 
     while (clock::now() < deadline) {
-        if (is_ready())
-            return true;
+        boost::system::error_code error;
+        const auto status = fs::status(path, error);
+        if (!error && fs::exists(status)) {
+            observed_existence = true;
+
+            if (fs::is_directory(status))
+                return true;
+
+            fs::ifstream stream(path, std::ios::binary);
+            if (stream.is_open())
+                return true;
+        } else if (!error && !fs::exists(status)) {
+            if (!observed_existence && wait_mode == HostPathWaitMode::FailIfMissing)
+                return false;
+        } else if (error) {
+            if (!observed_existence && wait_mode == HostPathWaitMode::FailIfMissing)
+                return false;
+
+            error.clear();
+        }
 
         std::this_thread::sleep_for(file_ready_poll_interval);
     }
 
-    return is_ready();
+    boost::system::error_code error;
+    const auto status = fs::status(path, error);
+    if (!error && fs::exists(status)) {
+        if (fs::is_directory(status))
+            return true;
+
+        fs::ifstream stream(path, std::ios::binary);
+        if (stream.is_open())
+            return true;
+    }
+
+    return false;
 }
 
 } // namespace
@@ -327,6 +363,7 @@ fs::path expand_path(IOState &io, const char *path, const fs::path &pref_path) {
 SceUID open_file(IOState &io, const char *path, const int flags, const fs::path &pref_path, const char *export_name) {
     auto device = device::get_device(path);
     auto device_for_icase = device;
+    const auto wait_mode = wait_mode_for_vita_path(path);
     if (device == VitaIoDevice::_INVALID) {
         LOG_ERROR("Cannot find device for path: {}", path);
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
@@ -368,11 +405,11 @@ SceUID open_file(IOState &io, const char *path, const int flags, const fs::path 
             fs::ofstream file(system_path);
         }
 
-        if (!wait_for_host_path_ready(system_path)) {
+        if (!wait_for_host_path_ready(system_path, wait_mode)) {
             LOG_ERROR("Timed out waiting for created file {} (target path: {})", system_path, path);
             return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
         }
-    } else if (!wait_for_host_path_ready(system_path)) {
+    } else if (!wait_for_host_path_ready(system_path, wait_mode)) {
         if (fs::exists(system_path)) {
             LOG_ERROR("Timed out waiting for file {} to become ready (target path: {})", system_path, path);
             return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
@@ -547,6 +584,7 @@ int stat_file(IOState &io, const char *file, SceIoStat *statp, const fs::path &p
     memset(statp, '\0', sizeof(SceIoStat));
 
     fs::path file_path = "";
+    const auto wait_mode = wait_mode_for_vita_path(file);
     if (fd == invalid_fd) {
         auto device = device::get_device(file);
         auto device_for_icase = device;
@@ -558,7 +596,7 @@ int stat_file(IOState &io, const char *file, SceIoStat *statp, const fs::path &p
         const auto translated_path = translate_path(file, device, io.device_paths);
         file_path = device::construct_emulated_path(device, translated_path, pref_path, io.redirect_stdio);
 
-        if (!wait_for_host_path_ready(file_path)) {
+        if (!wait_for_host_path_ready(file_path, wait_mode)) {
             if (fs::exists(file_path)) {
                 LOG_ERROR("Timed out waiting for file {} to become ready (target path: {})", file_path, file);
                 return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
@@ -607,7 +645,8 @@ int stat_file(IOState &io, const char *file, SceIoStat *statp, const fs::path &p
         statp->st_attr = fd_file->second.get_file_mode();
     }
 
-    if (!wait_for_host_path_ready(file_path)) {
+    const auto final_wait_mode = (fd == invalid_fd) ? wait_mode : HostPathWaitMode::WaitForAppearance;
+    if (!wait_for_host_path_ready(file_path, final_wait_mode)) {
         if (fs::exists(file_path)) {
             LOG_ERROR("Timed out waiting for file {} to become ready (target path: {})", file_path, file);
         } else {
