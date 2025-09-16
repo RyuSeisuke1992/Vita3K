@@ -33,6 +33,7 @@
 #include <gxm/functions.h>
 #include <gxm/state.h>
 #include <gxm/types.h>
+#include <io/functions.h>
 #include <kernel/state.h>
 #include <mem/state.h>
 
@@ -2113,6 +2114,13 @@ static void gxmSetUniformBuffers(renderer::State &state, GxmState &gxm, SceGxmCo
 }
 
 static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, const SceUID thread_id, SceGxmContext *context, SceGxmPrimitiveType primType, SceGxmIndexFormat indexType, Ptr<const void> indexData, uint32_t indexCount, uint32_t instanceCount) {
+    while (has_pending_host_path_failures()) {
+        if (!wait_for_pending_host_paths()) {
+            LOG_TRACE("{}: timed out waiting for host paths to become ready before draw", export_name);
+            break;
+        }
+    }
+
     if (!context || !indexData)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 

@@ -22,7 +22,10 @@
 #include <io/util.h>
 
 #include <map>
+#include <memory>
 #include <unordered_map>
+
+class PathAccessHandle;
 
 // Class for all needed information to access files on Vita3K.
 class FileStats : public VitaStats {
@@ -120,6 +123,7 @@ struct IOState {
     TtyFiles tty_files;
     StdFiles std_files;
     DirEntries dir_entries;
+    std::map<SceUID, std::shared_ptr<PathAccessHandle>> path_guards;
 
     std::unordered_map<std::string, std::string> cachemap;
     bool case_isens_find_enabled = false;

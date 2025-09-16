@@ -38,11 +38,18 @@
 
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #if defined(__aarch64__) && defined(__APPLE__)
 #define stat64 stat
@@ -64,6 +71,29 @@ constexpr bool log_file_op = true;
 constexpr bool log_file_read = false;
 constexpr bool log_file_seek = false;
 constexpr bool log_file_stat = false;
+
+namespace path_access_detail {
+class Entry;
+}
+
+class PathAccessHandle {
+public:
+    PathAccessHandle();
+    PathAccessHandle(std::shared_ptr<path_access_detail::Entry> entry, bool exclusive);
+    ~PathAccessHandle();
+
+    PathAccessHandle(const PathAccessHandle &) = delete;
+    PathAccessHandle &operator=(const PathAccessHandle &) = delete;
+
+    PathAccessHandle(PathAccessHandle &&other) noexcept;
+    PathAccessHandle &operator=(PathAccessHandle &&other) noexcept;
+
+private:
+    void release();
+
+    std::shared_ptr<path_access_detail::Entry> entry;
+    bool exclusive = false;
+};
 
 namespace vfs {
 
@@ -96,80 +126,407 @@ SceSize get_directory_used_size(const VitaIoDevice device, const std::string &vf
 
 namespace {
 
-const auto file_ready_timeout = std::chrono::milliseconds(1500);
-const auto file_ready_poll_interval = std::chrono::milliseconds(5);
-
-enum class HostPathWaitMode {
-    WaitForAppearance,
-    FailIfMissing
-};
-
-HostPathWaitMode wait_mode_for_vita_path(const char *vita_path) {
-    if (!vita_path)
-        return HostPathWaitMode::WaitForAppearance;
-
-    const auto lowered = string_utils::tolower(std::string(vita_path));
-
-    if (lowered.rfind("savedata0:", 0) == 0 || lowered.rfind("savedata1:", 0) == 0)
-        return HostPathWaitMode::FailIfMissing;
-
-    const auto user_pos = lowered.find("/user/");
-    if (user_pos != std::string::npos) {
-        const auto savedata_pos = lowered.find("/savedata/", user_pos + 6);
-        if (savedata_pos != std::string::npos)
-            return HostPathWaitMode::FailIfMissing;
-    }
-
-    return HostPathWaitMode::WaitForAppearance;
-}
-
-bool wait_for_host_path_ready(const fs::path &path, HostPathWaitMode wait_mode = HostPathWaitMode::WaitForAppearance,
-    std::chrono::milliseconds timeout = file_ready_timeout) {
-    using clock = std::chrono::steady_clock;
-
-    const auto deadline = clock::now() + timeout;
-    bool observed_existence = false;
-
-    while (clock::now() < deadline) {
-        boost::system::error_code error;
-        const auto status = fs::status(path, error);
-        if (!error && fs::exists(status)) {
-            observed_existence = true;
-
-            if (fs::is_directory(status))
-                return true;
-
-            fs::ifstream stream(path, std::ios::binary);
-            if (stream.is_open())
-                return true;
-        } else if (!error && !fs::exists(status)) {
-            if (!observed_existence && wait_mode == HostPathWaitMode::FailIfMissing)
-                return false;
-        } else if (error) {
-            if (!observed_existence && wait_mode == HostPathWaitMode::FailIfMissing)
-                return false;
-
-            error.clear();
-        }
-
-        std::this_thread::sleep_for(file_ready_poll_interval);
-    }
-
-    boost::system::error_code error;
-    const auto status = fs::status(path, error);
-    if (!error && fs::exists(status)) {
-        if (fs::is_directory(status))
-            return true;
-
-        fs::ifstream stream(path, std::ios::binary);
-        if (stream.is_open())
-            return true;
-    }
-
-    return false;
+std::string normalized_host_path(const fs::path &path) {
+    auto normalized = path.lexically_normal().generic_string();
+#ifdef _WIN32
+    normalized = string_utils::tolower(std::move(normalized));
+#endif
+    return normalized;
 }
 
 } // namespace
+
+namespace path_access_detail {
+
+class Entry : public std::enable_shared_from_this<Entry> {
+public:
+    Entry() = default;
+
+    void lock(const bool exclusive) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (exclusive) {
+            ++waiting_writers;
+            cv.wait(lock, [this] { return !writer_active && active_readers == 0; });
+            --waiting_writers;
+            writer_active = true;
+        } else {
+            cv.wait(lock, [this] { return !writer_active && waiting_writers == 0; });
+            ++active_readers;
+        }
+    }
+
+    void unlock(const bool exclusive) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (exclusive) {
+            writer_active = false;
+        } else {
+            assert(active_readers > 0);
+            --active_readers;
+        }
+        cv.notify_all();
+    }
+
+private:
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t active_readers = 0;
+    size_t waiting_writers = 0;
+    bool writer_active = false;
+};
+
+} // namespace path_access_detail
+
+namespace {
+
+using path_access_detail::Entry;
+
+class PathAccessManager {
+public:
+    std::shared_ptr<PathAccessHandle> acquire(const fs::path &path, const bool exclusive) {
+        return acquire_normalized(normalized_host_path(path), exclusive);
+    }
+
+    std::shared_ptr<PathAccessHandle> acquire_normalized(const std::string &normalized_path, const bool exclusive) {
+        auto entry = get_or_create_entry(normalized_path);
+        entry->lock(exclusive);
+        return std::make_shared<PathAccessHandle>(std::move(entry), exclusive);
+    }
+
+private:
+    std::shared_ptr<Entry> get_or_create_entry(const std::string &normalized_path) {
+        std::lock_guard<std::mutex> lock(map_mutex);
+        auto &weak_entry = entries[normalized_path];
+        auto entry = weak_entry.lock();
+        if (!entry) {
+            entry = std::make_shared<Entry>();
+            weak_entry = entry;
+        }
+        return entry;
+    }
+
+    std::mutex map_mutex;
+    std::unordered_map<std::string, std::weak_ptr<Entry>> entries;
+};
+
+PathAccessManager path_access_manager;
+
+constexpr auto host_path_ready_timeout = std::chrono::milliseconds(1500);
+constexpr auto host_path_ready_poll_interval = std::chrono::milliseconds(5);
+constexpr auto host_path_retry_cooldown = std::chrono::seconds(2);
+
+class HostPathReadinessTracker {
+public:
+    bool wait_for(const fs::path &path,
+        const std::string &normalized_key,
+        const bool exclusive,
+        std::shared_ptr<PathAccessHandle> &guard,
+        const bool require_readable,
+        const bool allow_release,
+        const bool use_failure_cache) {
+        if (check_ready(path, require_readable)) {
+            if (use_failure_cache)
+                clear_failure(normalized_key);
+            return true;
+        }
+
+        if (use_failure_cache) {
+            if (!should_wait_for_path(path))
+                return false;
+            if (should_skip_wait(normalized_key))
+                return false;
+        }
+
+        WaitRegistration wait_registration(*this);
+        wait_registration.activate();
+
+        const auto deadline = std::chrono::steady_clock::now() + host_path_ready_timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (allow_release && guard)
+                guard.reset();
+
+            std::this_thread::sleep_for(host_path_ready_poll_interval);
+
+            if (allow_release)
+                guard = path_access_manager.acquire_normalized(normalized_key, exclusive);
+
+            if (check_ready(path, require_readable)) {
+                if (use_failure_cache)
+                    clear_failure(normalized_key);
+                wait_registration.release();
+                return true;
+            }
+        }
+
+        if (use_failure_cache)
+            remember_failure(normalized_key);
+
+        return false;
+    }
+
+    bool wait_for_recorded_failures(const std::chrono::steady_clock::time_point deadline, const bool require_readable) {
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (!wait_for_active_waits(deadline))
+                return false;
+
+            const auto pending = snapshot_failures();
+            if (pending.empty())
+                return true;
+
+            bool all_ready = true;
+            for (const auto &normalized_key : pending) {
+                const fs::path host_path{ normalized_key };
+                const bool ready = [&]() {
+                    auto guard = path_access_manager.acquire_normalized(normalized_key, false);
+                    return check_ready(host_path, require_readable);
+                }();
+
+                if (ready) {
+                    clear_failure(normalized_key);
+                } else {
+                    all_ready = false;
+                    remember_failure(normalized_key);
+                }
+            }
+
+            if (all_ready)
+                return true;
+
+            std::this_thread::sleep_for(host_path_ready_poll_interval);
+        }
+
+        return false;
+    }
+
+    bool has_failures() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return !missing_paths.empty();
+    }
+
+    bool has_pending_work() const {
+        return has_pending_waits() || has_failures();
+    }
+
+    bool forget_failure(const std::string &normalized_key) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return missing_paths.erase(normalized_key) > 0;
+    }
+
+    void record_failure(const std::string &normalized_key) {
+        remember_failure(normalized_key);
+    }
+
+private:
+    class WaitRegistration {
+    public:
+        explicit WaitRegistration(HostPathReadinessTracker &tracker)
+            : tracker(tracker) {}
+
+        ~WaitRegistration() { release(); }
+
+        void activate() {
+            if (active)
+                return;
+
+            tracker.begin_wait();
+            active = true;
+        }
+
+        void release() {
+            if (!active)
+                return;
+
+            tracker.end_wait();
+            active = false;
+        }
+
+        WaitRegistration(const WaitRegistration &) = delete;
+        WaitRegistration &operator=(const WaitRegistration &) = delete;
+
+    private:
+        HostPathReadinessTracker &tracker;
+        bool active = false;
+    };
+
+    friend class WaitRegistration;
+
+    void begin_wait() {
+        std::lock_guard<std::mutex> lock(wait_mutex);
+        ++active_waiters;
+    }
+
+    void end_wait() {
+        std::lock_guard<std::mutex> lock(wait_mutex);
+        assert(active_waiters > 0);
+        --active_waiters;
+        if (active_waiters == 0)
+            wait_cv.notify_all();
+    }
+
+    bool wait_for_active_waits(const std::chrono::steady_clock::time_point deadline) {
+        std::unique_lock<std::mutex> lock(wait_mutex);
+        if (active_waiters == 0)
+            return true;
+
+        return wait_cv.wait_until(lock, deadline, [this] { return active_waiters == 0; });
+    }
+
+    bool has_pending_waits() const {
+        std::lock_guard<std::mutex> lock(wait_mutex);
+        return active_waiters != 0;
+    }
+
+    bool check_ready(const fs::path &path, const bool require_readable) const {
+        boost::system::error_code ec{};
+        if (!fs::exists(path, ec) || ec)
+            return false;
+
+        if (!require_readable)
+            return true;
+
+        if (fs::is_directory(path, ec) && !ec)
+            return true;
+
+        if (!fs::is_regular_file(path, ec) || ec)
+            return true;
+
+        fs::ifstream stream(path, std::ios::binary);
+        return stream.good();
+    }
+
+    bool should_wait_for_path(const fs::path &path) const {
+        if (!has_existing_ancestor(path))
+            return false;
+
+        const auto filename = path.filename().string();
+        const auto lowered_path = string_utils::tolower(path.generic_string());
+
+        if (lowered_path.find("/savedata/") != std::string::npos) {
+            if (filename.find('.') == std::string::npos)
+                return false;
+
+            const auto lowered_filename = string_utils::tolower(filename);
+            if (lowered_filename.rfind("slot", 0) == 0)
+                return false;
+        }
+
+        return true;
+    }
+
+    bool has_existing_ancestor(const fs::path &path) const {
+        boost::system::error_code ec{};
+        auto ancestor = path.parent_path();
+        while (!ancestor.empty()) {
+            if (fs::exists(ancestor, ec))
+                return !ec;
+
+            if (ec)
+                return false;
+
+            const auto parent = ancestor.parent_path();
+            if (parent == ancestor)
+                break;
+
+            ancestor = parent;
+        }
+
+        if (path.has_root_path()) {
+            ec.clear();
+            return fs::exists(path.root_path(), ec) && !ec;
+        }
+
+        return false;
+    }
+
+    bool should_skip_wait(const std::string &normalized_key) {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = missing_paths.find(normalized_key);
+        if (it == missing_paths.end())
+            return false;
+
+        if (now - it->second > host_path_retry_cooldown) {
+            missing_paths.erase(it);
+            return false;
+        }
+
+        return true;
+    }
+
+    void remember_failure(const std::string &normalized_key) {
+        std::lock_guard<std::mutex> lock(mutex);
+        missing_paths[normalized_key] = std::chrono::steady_clock::now();
+    }
+
+    void clear_failure(const std::string &normalized_key) {
+        std::lock_guard<std::mutex> lock(mutex);
+        missing_paths.erase(normalized_key);
+    }
+
+    std::vector<std::string> snapshot_failures() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<std::string> keys;
+        keys.reserve(missing_paths.size());
+        for (const auto &entry : missing_paths)
+            keys.push_back(entry.first);
+        return keys;
+    }
+
+    mutable std::mutex mutex;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> missing_paths;
+    mutable std::mutex wait_mutex;
+    std::condition_variable wait_cv;
+    size_t active_waiters = 0;
+};
+
+HostPathReadinessTracker host_path_readiness;
+
+} // namespace
+
+bool wait_for_pending_host_paths(const std::chrono::milliseconds max_wait) {
+    const auto budget = (max_wait.count() > 0) ? max_wait : host_path_ready_timeout;
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    return host_path_readiness.wait_for_recorded_failures(deadline, true);
+}
+
+bool has_pending_host_path_failures() {
+    return host_path_readiness.has_pending_work();
+}
+
+PathAccessHandle::PathAccessHandle() = default;
+
+PathAccessHandle::PathAccessHandle(std::shared_ptr<path_access_detail::Entry> entry, const bool exclusive)
+    : entry(std::move(entry))
+    , exclusive(exclusive) {}
+
+PathAccessHandle::~PathAccessHandle() {
+    release();
+}
+
+PathAccessHandle::PathAccessHandle(PathAccessHandle &&other) noexcept
+    : entry(std::move(other.entry))
+    , exclusive(other.exclusive) {
+    other.exclusive = false;
+}
+
+PathAccessHandle &PathAccessHandle::operator=(PathAccessHandle &&other) noexcept {
+    if (this != &other) {
+        release();
+        entry = std::move(other.entry);
+        exclusive = other.exclusive;
+        other.exclusive = false;
+    }
+    return *this;
+}
+
+void PathAccessHandle::release() {
+    if (!entry)
+        return;
+
+    auto local_entry = std::move(entry);
+    const bool was_exclusive = exclusive;
+    exclusive = false;
+    local_entry->unlock(was_exclusive);
+}
 
 bool init(IOState &io, const fs::path &cache_path, const fs::path &log_path, const fs::path &pref_path, bool redirect_stdio) {
     // Iterate through the entire list of devices and create the subdirectories if they do not exist
@@ -363,7 +720,6 @@ fs::path expand_path(IOState &io, const char *path, const fs::path &pref_path) {
 SceUID open_file(IOState &io, const char *path, const int flags, const fs::path &pref_path, const char *export_name) {
     auto device = device::get_device(path);
     auto device_for_icase = device;
-    const auto wait_mode = wait_mode_for_vita_path(path);
     if (device == VitaIoDevice::_INVALID) {
         LOG_ERROR("Cannot find device for path: {}", path);
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
@@ -392,59 +748,108 @@ SceUID open_file(IOState &io, const char *path, const int flags, const fs::path 
     }
 
     auto system_path = device::construct_emulated_path(device, translated_path, pref_path, io.redirect_stdio);
-    if (fs::is_directory(system_path)) {
-        LOG_ERROR("Cannot open directory: {}", system_path);
-        return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
-    }
+    const auto wants_write_lock = can_write(flags);
+    auto guard_key = normalized_host_path(system_path);
+    auto path_guard = path_access_manager.acquire_normalized(guard_key, wants_write_lock);
+
+    const auto original_system_path = system_path;
+    const auto original_guard_key = guard_key;
+    const auto lowered_request_path = string_utils::tolower(system_path.string());
 
     if (flags & SCE_O_CREAT) {
-        if (!fs::exists(system_path)) {
-            if (!fs::exists(system_path.parent_path())) {
-                fs::create_directories(system_path.parent_path());
-            }
-            fs::ofstream file(system_path);
-        }
-
-        if (!wait_for_host_path_ready(system_path, wait_mode)) {
-            LOG_ERROR("Timed out waiting for created file {} (target path: {})", system_path, path);
-            return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
-        }
-    } else if (!wait_for_host_path_ready(system_path, wait_mode)) {
         if (fs::exists(system_path)) {
-            LOG_ERROR("Timed out waiting for file {} to become ready (target path: {})", system_path, path);
-            return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
-        }
-
-        if (io.case_isens_find_enabled) {
-            // Attempt a case-insensitive file search.
-            const auto original_system_path = system_path;
-            const auto cached_path = find_in_cache(io, string_utils::tolower(system_path.string()));
-            if (!cached_path.empty()) {
-                system_path = cached_path;
-                LOG_TRACE("Found cached filepath at {}", system_path);
-            } else {
-                const bool path_found = find_case_isens_path(io, device_for_icase, translated_path, system_path);
-                system_path = find_in_cache(io, string_utils::tolower(system_path.string()));
-                if (!system_path.empty() && path_found) {
-                    LOG_TRACE("Found file on case-sensitive filesystem at {}", system_path);
-                } else {
-                    LOG_ERROR("Missing file at {} (target path: {})", original_system_path, path);
-                    return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
-                }
-            }
-
-            if (!wait_for_host_path_ready(system_path)) {
-                if (fs::exists(system_path)) {
-                    LOG_ERROR("Timed out waiting for file {} to become ready (target path: {})", system_path, path);
-                } else {
-                    LOG_ERROR("Missing file at {} (target path: {})", system_path, path);
-                }
+            if (fs::is_directory(system_path)) {
+                LOG_ERROR("Cannot open directory: {}", system_path);
                 return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
             }
         } else {
+            if (!fs::exists(system_path.parent_path()))
+                fs::create_directories(system_path.parent_path());
+
+            fs::ofstream file(system_path);
+        }
+    } else {
+        const bool requires_readable = ((flags & SCE_O_RDONLY) != 0) || ((flags & (SCE_O_RDONLY | SCE_O_WRONLY)) == 0);
+        auto switch_to_path = [&](const fs::path &new_path) {
+            const auto new_key = normalized_host_path(new_path);
+            if (new_key != guard_key) {
+                path_guard.reset();
+                path_guard = path_access_manager.acquire_normalized(new_key, wants_write_lock);
+                guard_key = new_key;
+            }
+            system_path = new_path;
+        };
+
+        auto ensure_ready_for_current_path = [&](bool use_failure_cache) {
+            return host_path_readiness.wait_for(system_path, guard_key, wants_write_lock, path_guard, requires_readable, true, use_failure_cache);
+        };
+
+        auto lookup_cached_case_path = [&]() -> fs::path {
+            return find_in_cache(io, lowered_request_path);
+        };
+
+        boost::system::error_code ec{};
+        bool ready = false;
+        bool cleared_original_failure = false;
+
+        if (fs::exists(system_path, ec) && !ec) {
+            ready = ensure_ready_for_current_path(true);
+        } else {
+            bool switched_to_case_variant = false;
+
+            if (io.case_isens_find_enabled) {
+                const auto cached_path = lookup_cached_case_path();
+                if (!cached_path.empty()) {
+                    switch_to_path(cached_path);
+                    LOG_TRACE("Found cached filepath at {}", system_path);
+                    switched_to_case_variant = system_path != original_system_path;
+                }
+            }
+
+            if (!switched_to_case_variant) {
+                if (!ensure_ready_for_current_path(true)) {
+                    if (!io.case_isens_find_enabled) {
+                        LOG_ERROR("Missing file at {} (target path: {})", system_path, path);
+                        return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+                    }
+
+                    cleared_original_failure = host_path_readiness.forget_failure(original_guard_key);
+
+                    const bool path_found = find_case_isens_path(io, device_for_icase, translated_path, original_system_path);
+                    const auto refreshed_path = lookup_cached_case_path();
+                    if (!refreshed_path.empty() && path_found) {
+                        switch_to_path(refreshed_path);
+                        LOG_TRACE("Found file on case-sensitive filesystem at {}", system_path);
+                        switched_to_case_variant = system_path != original_system_path;
+                    } else {
+                        if (cleared_original_failure)
+                            host_path_readiness.record_failure(original_guard_key);
+                        LOG_ERROR("Missing file at {} (target path: {})", original_system_path, path);
+                        return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+                    }
+                } else {
+                    ready = true;
+                }
+            }
+
+            if (!ready)
+                ready = ensure_ready_for_current_path(true);
+
+            if (system_path != original_system_path)
+                host_path_readiness.forget_failure(original_guard_key);
+        }
+
+        if (!ready) {
             LOG_ERROR("Missing file at {} (target path: {})", system_path, path);
+            if (cleared_original_failure && system_path == original_system_path)
+                host_path_readiness.record_failure(original_guard_key);
             return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
         }
+    }
+
+    if (fs::is_directory(system_path)) {
+        LOG_ERROR("Cannot open directory: {}", system_path);
+        return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
 
     const auto normalized_path = device::construct_normalized_path(device, translated_path);
@@ -452,6 +857,7 @@ SceUID open_file(IOState &io, const char *path, const int flags, const fs::path 
     FileStats f{ path, normalized_path, system_path, flags };
     const auto fd = io.next_fd++;
     io.std_files.emplace(fd, f);
+    io.path_guards.emplace(fd, std::move(path_guard));
 
     LOG_TRACE_IF(log_file_op, "{}: Opening file {} ({}), fd: {}", export_name, path, normalized_path, log_hex(fd));
     return fd;
@@ -583,8 +989,11 @@ int stat_file(IOState &io, const char *file, SceIoStat *statp, const fs::path &p
 
     memset(statp, '\0', sizeof(SceIoStat));
 
-    fs::path file_path = "";
-    const auto wait_mode = wait_mode_for_vita_path(file);
+    fs::path file_path;
+    std::shared_ptr<PathAccessHandle> path_guard;
+    std::string guard_key;
+    bool allow_release = true;
+
     if (fd == invalid_fd) {
         auto device = device::get_device(file);
         auto device_for_icase = device;
@@ -596,12 +1005,10 @@ int stat_file(IOState &io, const char *file, SceIoStat *statp, const fs::path &p
         const auto translated_path = translate_path(file, device, io.device_paths);
         file_path = device::construct_emulated_path(device, translated_path, pref_path, io.redirect_stdio);
 
-        if (!wait_for_host_path_ready(file_path, wait_mode)) {
-            if (fs::exists(file_path)) {
-                LOG_ERROR("Timed out waiting for file {} to become ready (target path: {})", file_path, file);
-                return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
-            }
+        guard_key = normalized_host_path(file_path);
+        path_guard = path_access_manager.acquire_normalized(guard_key, false);
 
+        if (!fs::exists(file_path)) {
             if (io.case_isens_find_enabled) {
                 // Attempt a case-insensitive file search.
                 const auto original_file_path = file_path;
@@ -620,19 +1027,17 @@ int stat_file(IOState &io, const char *file, SceIoStat *statp, const fs::path &p
                     }
                 }
 
-                if (!wait_for_host_path_ready(file_path)) {
-                    if (fs::exists(file_path)) {
-                        LOG_ERROR("Timed out waiting for file {} to become ready (target path: {})", file_path, file);
-                    } else {
-                        LOG_ERROR("Missing file at {} (target path: {})", file_path, file);
-                    }
-                    return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
-                }
             } else {
                 LOG_ERROR("Missing file at {} (target path: {})", file_path, file);
                 return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
             }
         }
+
+        if (!fs::exists(file_path)) {
+            LOG_ERROR("Missing file at {} (target path: {})", file_path, file);
+            return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+        }
+
         LOG_TRACE_IF(log_file_op && log_file_stat, "{}: Statting file: {} ({})", export_name, file, device::construct_normalized_path(device, translated_path));
     } else { // We have previously opened and defined the location
         const auto fd_file = io.std_files.find(fd);
@@ -640,18 +1045,29 @@ int stat_file(IOState &io, const char *file, SceIoStat *statp, const fs::path &p
             return IO_ERROR(SCE_ERROR_ERRNO_EBADFD);
 
         file_path = fd_file->second.get_system_location();
+        guard_key = normalized_host_path(file_path);
+        const auto guard_it = io.path_guards.find(fd);
+        if (guard_it != io.path_guards.end()) {
+            path_guard = guard_it->second;
+            allow_release = false;
+        } else {
+            path_guard = path_access_manager.acquire_normalized(guard_key, false);
+        }
+
         LOG_TRACE_IF(log_file_op && log_file_stat, "{}: Statting fd: {}", export_name, log_hex(fd));
 
         statp->st_attr = fd_file->second.get_file_mode();
     }
 
-    const auto final_wait_mode = (fd == invalid_fd) ? wait_mode : HostPathWaitMode::WaitForAppearance;
-    if (!wait_for_host_path_ready(file_path, final_wait_mode)) {
-        if (fs::exists(file_path)) {
-            LOG_ERROR("Timed out waiting for file {} to become ready (target path: {})", file_path, file);
-        } else {
-            LOG_ERROR("Missing file at {} (target path: {})", file_path, file);
-        }
+    const auto resolved_key = normalized_host_path(file_path);
+    if (allow_release && resolved_key != guard_key) {
+        path_guard.reset();
+        path_guard = path_access_manager.acquire_normalized(resolved_key, false);
+    }
+    guard_key = resolved_key;
+
+    if (!host_path_readiness.wait_for(file_path, guard_key, false, path_guard, false, allow_release, true)) {
+        LOG_ERROR("Missing file at {} (target path: {})", file_path, file);
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
 
@@ -717,6 +1133,7 @@ int close_file(IOState &io, const SceUID fd, const char *export_name) {
     LOG_TRACE_IF(log_file_op, "{}: Closing file fd: {}", export_name, log_hex(fd));
 
     io.tty_files.erase(fd);
+    io.path_guards.erase(fd);
     io.std_files.erase(fd);
 
     return 0;
@@ -736,6 +1153,7 @@ int remove_file(IOState &io, const char *file, const fs::path &pref_path, const 
     }
 
     const auto emulated_path = device::construct_emulated_path(device, translated_path, pref_path, io.redirect_stdio);
+    auto path_guard = path_access_manager.acquire(emulated_path, true);
     if (!fs::exists(emulated_path) || fs::is_directory(emulated_path)) {
         LOG_ERROR("File does not exist at path: {} (target path: {})", emulated_path, file);
     }
@@ -774,16 +1192,29 @@ int rename(IOState &io, const char *old_name, const char *new_name, const fs::pa
     }
 
     const auto emulated_old_path = device::construct_emulated_path(device, translated_old_path, pref_path, io.redirect_stdio);
-    if (!wait_for_host_path_ready(emulated_old_path)) {
-        if (!fs::exists(emulated_old_path)) {
-            LOG_ERROR("File does not exist at path: {} (target path: {})", emulated_old_path, old_name);
-        } else {
-            LOG_ERROR("Timed out waiting for file {} to become ready for rename (target path: {})", emulated_old_path, old_name);
-        }
-        return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+    const auto emulated_new_path = device::construct_emulated_path(device, translated_new_path, pref_path, io.redirect_stdio);
+
+    const auto old_key = normalized_host_path(emulated_old_path);
+    const auto new_key = normalized_host_path(emulated_new_path);
+
+    std::shared_ptr<PathAccessHandle> old_guard;
+    std::shared_ptr<PathAccessHandle> new_guard;
+
+    if (old_key <= new_key) {
+        old_guard = path_access_manager.acquire_normalized(old_key, true);
+        if (old_key == new_key)
+            new_guard = old_guard;
+        else
+            new_guard = path_access_manager.acquire_normalized(new_key, true);
+    } else {
+        new_guard = path_access_manager.acquire_normalized(new_key, true);
+        old_guard = path_access_manager.acquire_normalized(old_key, true);
     }
 
-    const auto emulated_new_path = device::construct_emulated_path(device, translated_new_path, pref_path, io.redirect_stdio);
+    if (!host_path_readiness.wait_for(emulated_old_path, old_key, true, old_guard, true, false, false)) {
+        LOG_ERROR("File does not exist at path: {} (target path: {})", emulated_old_path, old_name);
+        return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+    }
 
     LOG_TRACE_IF(log_file_op, "{}: Renaming file {} to {} ({} to {})", export_name, old_name, new_name, emulated_old_path, emulated_new_path);
 
@@ -796,12 +1227,11 @@ int rename(IOState &io, const char *old_name, const char *new_name, const fs::pa
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
 
-    if (!wait_for_host_path_ready(emulated_new_path)) {
-        if (fs::exists(emulated_new_path)) {
-            LOG_ERROR("Timed out waiting for renamed file {} to become ready (target path: {})", emulated_new_path, new_name);
-        } else {
-            LOG_ERROR("Missing file at {} after rename (target path: {})", emulated_new_path, new_name);
-        }
+    if (old_guard && old_guard != new_guard)
+        old_guard.reset();
+
+    if (!host_path_readiness.wait_for(emulated_new_path, new_key, true, new_guard, true, false, true)) {
+        LOG_ERROR("Destination not ready at {} (target path: {})", emulated_new_path, new_name);
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
 
@@ -981,9 +1411,12 @@ int remove_dir(IOState &io, const char *dir, const fs::path &pref_path, const ch
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
 
+    const auto emulated_path = device::construct_emulated_path(device, translated_path, pref_path, io.redirect_stdio);
+    auto path_guard = path_access_manager.acquire(emulated_path, true);
+
     LOG_TRACE_IF(log_file_op, "{}: Removing dir {} ({})", export_name, dir, device::construct_normalized_path(device, translated_path));
 
-    if (!fs::remove_all(device::construct_emulated_path(device, translated_path, pref_path, io.redirect_stdio))) {
+    if (!fs::remove_all(emulated_path)) {
         LOG_ERROR("Cannot remove dir: {} ({})", dir, device::construct_normalized_path(device, translated_path));
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
