@@ -45,7 +45,10 @@ fs::path expand_path(IOState &io, const char *path, const fs::path &pref_path);
 std::string translate_path(const char *path, VitaIoDevice &device, const IOState::DevicePaths &device_paths);
 
 bool has_pending_host_path_failures();
-bool wait_for_pending_host_paths(std::chrono::milliseconds max_wait = std::chrono::milliseconds(1500));
+bool wait_for_pending_host_paths(std::chrono::milliseconds max_wait = std::chrono::milliseconds(60));
+
+bool has_pending_asset_io();
+bool wait_for_pending_asset_io(std::chrono::milliseconds max_wait = std::chrono::milliseconds(60));
 
 /**
  * @brief Copy all directories and files from one location into another

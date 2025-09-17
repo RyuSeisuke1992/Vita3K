@@ -124,6 +124,7 @@ struct IOState {
     StdFiles std_files;
     DirEntries dir_entries;
     std::map<SceUID, std::shared_ptr<PathAccessHandle>> path_guards;
+    std::unordered_map<SceUID, std::string> asset_paths;
 
     std::unordered_map<std::string, std::string> cachemap;
     bool case_isens_find_enabled = false;

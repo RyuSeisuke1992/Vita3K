@@ -2114,10 +2114,17 @@ static void gxmSetUniformBuffers(renderer::State &state, GxmState &gxm, SceGxmCo
 }
 
 static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, const SceUID thread_id, SceGxmContext *context, SceGxmPrimitiveType primType, SceGxmIndexFormat indexType, Ptr<const void> indexData, uint32_t indexCount, uint32_t instanceCount) {
+    if (has_pending_asset_io()) {
+        if (!wait_for_pending_asset_io()) {
+            LOG_TRACE("{}: timed out waiting for asset IO to settle before draw", export_name);
+            return 0;
+        }
+    }
+
     while (has_pending_host_path_failures()) {
         if (!wait_for_pending_host_paths()) {
             LOG_TRACE("{}: timed out waiting for host paths to become ready before draw", export_name);
-            break;
+            return 0;
         }
     }
 

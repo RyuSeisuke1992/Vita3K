@@ -134,6 +134,25 @@ std::string normalized_host_path(const fs::path &path) {
     return normalized;
 }
 
+bool should_track_asset_io(VitaIoDevice device, const fs::path &system_path) {
+    switch (device) {
+    case +VitaIoDevice::app0:
+    case +VitaIoDevice::addcont0:
+    case +VitaIoDevice::gro0:
+    case +VitaIoDevice::grw0:
+        return true;
+    case +VitaIoDevice::ux0: {
+        const auto lowered = string_utils::tolower(system_path.generic_string());
+        return lowered.find("/app/") != std::string::npos || lowered.find("/patch/") != std::string::npos
+            || lowered.find("/addcont/") != std::string::npos;
+    }
+    default:
+        break;
+    }
+
+    return false;
+}
+
 } // namespace
 
 namespace path_access_detail {
@@ -210,9 +229,81 @@ private:
 
 PathAccessManager path_access_manager;
 
-constexpr auto host_path_ready_timeout = std::chrono::milliseconds(1500);
+constexpr auto host_path_ready_timeout = std::chrono::milliseconds(60);
 constexpr auto host_path_ready_poll_interval = std::chrono::milliseconds(5);
 constexpr auto host_path_retry_cooldown = std::chrono::seconds(2);
+
+constexpr auto asset_io_settle_time = std::chrono::milliseconds(2);
+
+class AssetIoTracker {
+public:
+    void begin(const std::string &normalized_key) {
+        if (normalized_key.empty())
+            return;
+
+        std::lock_guard<std::mutex> lock(mutex);
+        auto &entry = entries[normalized_key];
+        ++entry.active_readers;
+        entry.last_activity = std::chrono::steady_clock::now();
+    }
+
+    void end(const std::string &normalized_key) {
+        if (normalized_key.empty())
+            return;
+
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = entries.find(normalized_key);
+        if (it == entries.end())
+            return;
+
+        if (it->second.active_readers > 0)
+            --it->second.active_readers;
+
+        it->second.last_activity = std::chrono::steady_clock::now();
+        cv.notify_all();
+    }
+
+    bool has_pending() {
+        std::lock_guard<std::mutex> lock(mutex);
+        prune_expired_locked(std::chrono::steady_clock::now());
+        return !entries.empty();
+    }
+
+    bool wait_until(const std::chrono::steady_clock::time_point deadline) {
+        std::unique_lock<std::mutex> lock(mutex);
+        auto predicate = [&]() {
+            prune_expired_locked(std::chrono::steady_clock::now());
+            return entries.empty();
+        };
+
+        if (predicate())
+            return true;
+
+        return cv.wait_until(lock, deadline, predicate);
+    }
+
+private:
+    struct Entry {
+        size_t active_readers = 0;
+        std::chrono::steady_clock::time_point last_activity{};
+    };
+
+    void prune_expired_locked(const std::chrono::steady_clock::time_point now) {
+        for (auto it = entries.begin(); it != entries.end();) {
+            if (it->second.active_readers == 0 && (now - it->second.last_activity) >= asset_io_settle_time) {
+                it = entries.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::unordered_map<std::string, Entry> entries;
+};
+
+AssetIoTracker asset_io_tracker;
 
 class HostPathReadinessTracker {
 public:
@@ -492,6 +583,16 @@ bool has_pending_host_path_failures() {
     return host_path_readiness.has_pending_work();
 }
 
+bool wait_for_pending_asset_io(const std::chrono::milliseconds max_wait) {
+    const auto budget = (max_wait.count() > 0) ? max_wait : host_path_ready_timeout;
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    return asset_io_tracker.wait_until(deadline);
+}
+
+bool has_pending_asset_io() {
+    return asset_io_tracker.has_pending();
+}
+
 PathAccessHandle::PathAccessHandle() = default;
 
 PathAccessHandle::PathAccessHandle(std::shared_ptr<path_access_detail::Entry> entry, const bool exclusive)
@@ -756,6 +857,8 @@ SceUID open_file(IOState &io, const char *path, const int flags, const fs::path 
     const auto original_guard_key = guard_key;
     const auto lowered_request_path = string_utils::tolower(system_path.string());
 
+    const bool requires_readable = ((flags & SCE_O_RDONLY) != 0) || ((flags & (SCE_O_RDONLY | SCE_O_WRONLY)) == 0);
+
     if (flags & SCE_O_CREAT) {
         if (fs::exists(system_path)) {
             if (fs::is_directory(system_path)) {
@@ -769,7 +872,6 @@ SceUID open_file(IOState &io, const char *path, const int flags, const fs::path 
             fs::ofstream file(system_path);
         }
     } else {
-        const bool requires_readable = ((flags & SCE_O_RDONLY) != 0) || ((flags & (SCE_O_RDONLY | SCE_O_WRONLY)) == 0);
         auto switch_to_path = [&](const fs::path &new_path) {
             const auto new_key = normalized_host_path(new_path);
             if (new_key != guard_key) {
@@ -854,10 +956,17 @@ SceUID open_file(IOState &io, const char *path, const int flags, const fs::path 
 
     const auto normalized_path = device::construct_normalized_path(device, translated_path);
 
+    const bool track_asset_io = requires_readable && should_track_asset_io(device, system_path);
+
     FileStats f{ path, normalized_path, system_path, flags };
     const auto fd = io.next_fd++;
     io.std_files.emplace(fd, f);
     io.path_guards.emplace(fd, std::move(path_guard));
+
+    if (track_asset_io) {
+        asset_io_tracker.begin(guard_key);
+        io.asset_paths.emplace(fd, guard_key);
+    }
 
     LOG_TRACE_IF(log_file_op, "{}: Opening file {} ({}), fd: {}", export_name, path, normalized_path, log_hex(fd));
     return fd;
@@ -1134,6 +1243,11 @@ int close_file(IOState &io, const SceUID fd, const char *export_name) {
 
     io.tty_files.erase(fd);
     io.path_guards.erase(fd);
+    auto asset_it = io.asset_paths.find(fd);
+    if (asset_it != io.asset_paths.end()) {
+        asset_io_tracker.end(asset_it->second);
+        io.asset_paths.erase(asset_it);
+    }
     io.std_files.erase(fd);
 
     return 0;
